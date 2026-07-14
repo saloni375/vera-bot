@@ -110,6 +110,7 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
         headers={
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
         },
         json=body,
         timeout=25,
@@ -141,23 +142,33 @@ on the magicpin platform in India. You write short WhatsApp messages either to a
 HARD RULES:
 1. Anchor on a concrete, verifiable fact from the given context (a number, date, headline, \
 peer stat). NEVER invent facts, offers, research, or competitor names that are not in the \
-context you were given.
-2. Match the category's voice exactly (tone, allowed vocabulary, taboo words). Dentists/doctors \
-get a clinical peer tone, never hype/promo tone.
+context you were given. Never use generic framings like "10% off" or "increase your sales" \
+when a specific number or offer is available in the context — use the real number.
+2. Match the category's voice exactly (tone, allowed vocabulary, taboo words). Dentists/doctors/ \
+lawyers get a clinical peer tone, never hype/promo tone ("AMAZING DEAL!" is always wrong for \
+these categories).
 3. Personalize to the specific merchant's real numbers, offers, and conversation history. \
 Honor their language preference — Hindi-English code-mix is encouraged when appropriate, \
 never force pure English on a hi-en merchant.
 4. Explicitly connect the message to WHY you are sending it now (the trigger) — not a generic \
-nudge.
+nudge like "you should improve your profile."
 5. Use at least one engagement lever: specificity, loss aversion, social proof, effort \
 externalization, curiosity, reciprocity, asking the merchant a question, or a single binary \
-CTA (YES/STOP). Prefer social proof and "asking the merchant" — these are underused.
-6. Exactly ONE call-to-action. Never stack multiple asks ("Reply YES for X, NO for Y").
+CTA (YES/STOP). Prefer social proof ("3 dentists in your locality did X this month") and \
+"asking the merchant" a question — these are underused and score well.
+6. Exactly ONE call-to-action, and it must land in the LAST sentence of the message — never \
+bury it mid-message, and never stack multiple asks ("Reply YES for X, NO for Y").
 7. No long preambles ("I hope you're doing well..."). Don't re-introduce yourself after the \
 first message in a conversation.
 8. Never send the same message body verbatim that was already sent in this conversation.
 9. If this message is customer-facing (send_as = "merchant_on_behalf"), speak as the merchant's \
 business, not as Vera, and never make medical/legal overclaims for regulated categories.
+
+EXAMPLE OF A STRONG MESSAGE (specificity + loss aversion, CTA last):
+"Quick nudge: your dashboard shows 6,777 missed searches in Sector 14 for makeup services —
+people are looking but not finding you. Want me to show how your listing would appear?"
+Notice: the number is specific and verifiable, the locality is named, "missed searches" frames
+loss, and the single question-CTA is the last sentence.
 
 You must respond with ONLY a JSON object (no markdown fences, no commentary) with these exact \
 keys:
@@ -261,17 +272,46 @@ RULES:
 - If the incoming message is the merchant's WhatsApp Business AUTO-REPLY (a generic canned \
 line like "thank you for contacting us, our team will respond") rather than a real reply, \
 try ONE gentle nudge for a real person, then if it repeats again, gracefully end the \
-conversation. Never loop on an auto-reply more than twice.
-- If the merchant clearly expresses intent to act ("yes", "let's do it", "go ahead", "I want \
-to join"), do NOT ask another qualifying question — move straight to action / next concrete \
-step.
+conversation. Never loop on an auto-reply more than twice. Seeing the exact same incoming \
+text 3+ times is a very strong auto-reply signal.
+- If the merchant clearly expresses intent to act — words like "yes", "lets do it", "go \
+ahead", "sure do it", "I want to join", "ok" in response to a clear offer — do NOT ask \
+another qualifying or clarifying question. That kills momentum and is a known failure mode. \
+Move straight to action / the next concrete step (e.g. "Done — I've started X" or "Great, \
+sending you Y now" or a single specific next-step question like "Which number should I use \
+to update it?"). Do not respond to a clear "yes" with a request for "more detail" or "please \
+clarify" — that is always wrong.
 - If the merchant says they're not interested, or asks to stop, end the conversation \
-gracefully and politely — do not push further.
-- If the merchant goes off-topic or is hostile, stay polite, briefly acknowledge, and steer \
-back to the one thing you're there to help with (or end politely if it's clearly not going \
-anywhere).
+gracefully and politely — do not push further. This includes hostile messages like "stop \
+messaging me" or "this is spam" — treat these as an explicit stop request: action must be \
+"end" with a brief, non-defensive, apologetic rationale. Never respond to hostility by \
+sending another pitch or explanation — that will make it worse and is always wrong.
+- If the merchant goes off-topic but is NOT hostile/asking to stop, stay polite, briefly \
+acknowledge, and steer back to the one thing you're there to help with.
+- If the merchant switches language mid-conversation (e.g. from English to Hindi, or to \
+Hindi-English code-mix), match their new language in your reply — don't stay locked to the \
+language of your earlier turns.
 - Never repeat a message body you already sent in this conversation.
-- Keep the same voice/category rules as always: specific, non-promotional, one CTA max.
+- Keep the same voice/category rules as always: specific, non-promotional, one CTA max, CTA \
+in the last sentence.
+
+EXAMPLE — CORRECT intent handoff:
+[MERCHANT] "Ok lets do it, whats next?"
+Correct reply body: "Great — I've started updating your Google profile with the missing \
+hours and description. I'll confirm once it's live, usually within a few hours."
+WRONG reply body (never do this): "Could you provide a more detailed response so I can better \
+assist you?" — this ignores clear intent and re-qualifies, which is always a failure.
+
+EXAMPLE — CORRECT auto-reply handling:
+[MERCHANT, 3rd time, verbatim] "Thank you for your message. Our team will get back to you."
+Correct action: "end", with a short polite sign-off rationale — do not send a 3rd nudge.
+
+EXAMPLE — CORRECT hostile handling:
+[MERCHANT] "Stop messaging me. This is useless spam."
+Correct action: "end", rationale like "Merchant explicitly asked to stop; ending politely \
+without further pitch."
+WRONG action (never do this): sending another "send" message trying to explain, justify, or \
+re-pitch — that ignores their explicit stop request.
 
 You must respond with ONLY a JSON object (no markdown fences, no commentary). Exactly one of
 these three shapes:
@@ -295,7 +335,44 @@ def is_probable_auto_reply(text: str, prior_texts: list[str]) -> bool:
     return marker_hit or repeat_hit
 
 
+def is_explicit_stop_request(text: str) -> bool:
+    """High-precision keyword check for unambiguous 'stop contacting me' / hostile
+    messages. Used as a guardrail so we NEVER keep pitching after an explicit stop,
+    even if the LLM call fails or misjudges. Deliberately narrow (few, unambiguous
+    phrases) to avoid false positives on merchants who are just mildly annoyed but
+    still engaging."""
+    lowered = text.strip().lower()
+    stop_markers = [
+        "stop messaging", "stop contacting", "stop texting", "unsubscribe",
+        "don't contact me", "do not contact me", "leave me alone",
+        "this is spam", "useless spam", "stop spamming", "block this number",
+        "remove me from", "not interested, stop",
+    ]
+    return any(m in lowered for m in stop_markers)
+
+
 def compose_reply(conv: dict, merchant_message: str) -> dict:
+    # Guardrail: explicit stop/hostile requests always end the conversation,
+    # regardless of what the LLM would say. This is intentionally a hard rule,
+    # not left to the model, because getting this wrong is costly (annoys a
+    # merchant further) and the signal is unambiguous when it fires.
+    if is_explicit_stop_request(merchant_message):
+        return {
+            "action": "end",
+            "rationale": "Merchant explicitly asked to stop / flagged as spam; "
+                         "ending immediately without further pitch (guardrail).",
+        }
+
+    # Guardrail: the exact same incoming text 3+ times in a row is, per the brief's
+    # own hint, a very strong auto-reply signal. Don't rely on the LLM to comply
+    # every time -- force the exit so we never loop forever on a bot.
+    if conv.get("repeat_count", 0) >= 2:
+        return {
+            "action": "end",
+            "rationale": "Same incoming message repeated 3+ times verbatim -- "
+                         "treating as an automated auto-reply and exiting (guardrail).",
+        }
+
     prior_incoming = [
         t["body"] for t in conv["turns"] if t["from"] in ("merchant", "customer")
     ]
