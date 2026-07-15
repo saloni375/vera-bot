@@ -29,7 +29,6 @@ import re
 import time
 import json
 import uuid
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
@@ -52,11 +51,6 @@ START_TIME = time.time()
 # NEVER hard-code the real key into this file if you're going to push it to
 # a public GitHub repo.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-# llama-3.3-70b-versatile has a very small free-tier daily quota on Groq and
-# was getting exhausted mid-test (every single call 429'd -- see logs). The
-# 8b-instant model has a much larger free-tier allowance and is still good
-# enough for structured JSON message composition. Override via env var if a
-# paid/higher-quota key is available.
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -85,20 +79,12 @@ conversations: dict[str, dict] = {}
 # don't send the same trigger twice.
 fired_suppression_keys: set[str] = set()
 
-# merchant_repeat_tracker[merchant_id] = {"last_text": str|None, "count": int}
-#
-# WHY THIS EXISTS: the conversation-level repeat_count guardrail only works if
-# the SAME conversation_id is reused across turns. The judge harness (and its
-# local simulator) sometimes sends a fresh conversation_id per turn for the
-# same merchant (e.g. conv_auto_1, conv_auto_2, ...) while testing auto-reply
-# detection -- in that case a per-conversation counter never accumulates and
-# the bot would loop forever. Tracking repeats per merchant_id (independent of
-# conversation_id) closes that gap. Trade-off: if the *same* real merchant
-# legitimately sends the exact same short reply (e.g. "yes") 3+ times across
-# genuinely different conversations, this could end one of them a bit early --
-# an acceptable trade given the alternative (never detecting a canned
-# auto-reply loop) is the explicitly-penalized failure mode.
-merchant_repeat_tracker: dict[str, dict] = {}
+# Tracks how many times we've seen a canned/auto-reply-looking message FROM A GIVEN
+# MERCHANT, across all conversations. We key by merchant (not conversation_id)
+# because a merchant's WhatsApp auto-reply can arrive under different
+# conversation_ids (e.g. one per trigger/tick), so per-conversation repeat
+# counting alone would miss it.
+canned_auto_reply_hits: dict[str, int] = {}
 
 
 def get_ctx(scope: str, context_id: str) -> Optional[dict]:
@@ -110,18 +96,14 @@ def get_ctx(scope: str, context_id: str) -> Optional[dict]:
 # LLM call (Gemini)
 # -----------------------------------------------------------------------------
 
-def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 350) -> str:
+def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
     """Calls Groq (Llama 3.3 70B) and returns raw text output. Temperature=0 for
     determinism. Named call_claude for minimal diff elsewhere in this file --
     it's the one function that talks to whichever LLM we're using.
 
-    Retries once on HTTP 429 (rate limited). This matters because a burst of
-    concurrent tick() compositions (or a shared Groq key also being hit by a
-    local test scorer) can trip Groq's free-tier rate limit -- without a retry,
-    every 429'd call falls straight to the generic fallback_compose() text,
-    which scores badly (low specificity/merchant fit) even though nothing is
-    actually wrong with the prompt. One short backoff-and-retry recovers most
-    of these without blowing the caller's ~30s response budget."""
+    Retries a few times with backoff on rate limits (429) and transient server
+    errors (5xx) before giving up -- these are common on free-tier API keys
+    under bursty load and are usually resolved within a second or two."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
 
@@ -140,42 +122,25 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 350) -> 
         "User-Agent": "Mozilla/5.0",
     }
 
-    last_exc: Optional[Exception] = None
-    max_attempts = 2  # 1 initial try + 1 retry. The judge harness's /v1/tick
-    # call has a hard ~15s client-side read timeout -- a composition (or
-    # several, running concurrently under the semaphore) must return well
-    # inside that. More attempts sounds safer but actually causes silent
-    # request timeouts (worse than a fallback response, since the judge gets
-    # NOTHING) if the total retry time creeps past ~15s. Keep this small.
-    for attempt in range(max_attempts):
+    last_exc = None
+    delays = [0, 1.2]  # immediate try, then one short backoff retry -- kept short
+                       # so a few triggers in one /v1/tick call don't blow the 30s budget
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
         try:
-            resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=6)
-            if resp.status_code == 429:
-                # Respect Retry-After but cap hard at 1.5s -- large values
-                # (seen: 38s, meaning a daily quota window, not a transient
-                # burst) can't be waited out inside one request anyway; if
-                # quota is genuinely exhausted, fail fast to fallback_compose
-                # instead of eating the tick's time budget and returning
-                # nothing at all.
-                retry_after = resp.headers.get("Retry-After")
-                wait_s = min(float(retry_after), 1.5) if retry_after else 1.5
-                last_exc = RuntimeError("Groq rate-limited (429)")
-                if attempt < max_attempts - 1:
-                    log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}/{max_attempts}); "
-                                f"retrying in {wait_s:.1f}s")
-                    time.sleep(wait_s)
-                    continue
-                log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}/{max_attempts}); giving up")
-                raise last_exc
+            resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=25)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                # Rate-limited or transient server error -- worth retrying.
+                last_exc = RuntimeError(f"Groq returned {resp.status_code}, retrying")
+                continue
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
-        except requests.exceptions.RequestException as e:
+        except requests.RequestException as e:
             last_exc = e
-            if attempt < max_attempts - 1:
-                time.sleep(0.5)
-                continue
-            raise
+            continue
+
     raise last_exc or RuntimeError("Groq call failed after retries")
 
 
@@ -232,35 +197,12 @@ business, not as Vera, and never make medical/legal overclaims for regulated cat
 10. NEVER expose internal system details in the message body: no field/key names (e.g. \
 "trigger_id", "merchant_id", "suppression_key", "urgency"), no raw JSON, no internal jargon. \
 Write only natural human WhatsApp language a real person would send.
-11. ALWAYS greet the merchant by their actual name — pull it from merchant.identity.name (use \
-"Dr. <Surname>" for dentists/doctors, first name for other categories). A generic "Hi" or "Hi \
-there" with no name, when a name is available in the context, is always a mistake.
-12. If the message references external research, a digest item, a compliance/recall notice, or \
-any claim that has a "source" field in the context, you MUST end the message with a short \
-citation of that source (e.g. "— JIDA Oct 2026 p.14", "— DCI circular", a batch/reference \
-number). A research or compliance claim with no citation is always a mistake — it reads as \
-unverifiable.
-13. Add judgment, not just templating: if the data in the context suggests a non-obvious or \
-counter-intuitive move (e.g. recommending the merchant SKIP a promo that would seem obvious, or \
-wait rather than act right now), say so plainly and give the one-line reason. This kind of call \
-is a stronger signal of real category understanding than generic encouragement.
-14. A true binary CTA (a single yes/no or YES/STOP style question) is preferred over a \
-numbered multi-option choice. If offering specific slots/options is unavoidable, keep it to at \
-most two named options plus an open fallback ("Wed 6pm or Thu 5pm, or tell me a time that \
-works") rather than three or more stacked choices.
 
-EXAMPLE OF A STRONG MESSAGE (specificity + loss aversion, CTA last, source-free since it's a \
-dashboard stat rather than external research):
-"Ramesh, your dashboard shows 8,412 missed searches in Koramangala for teeth-whitening this
-month — people are searching but not finding your listing. Want me to show what a fixed
-listing would look like?"
-Notice: the merchant is greeted by name, the number and locality are specific and verifiable,
-"missed searches" frames the loss, and the single question-CTA is the last sentence.
-
-EXAMPLE OF A CITED RESEARCH CLAIM (rule 12):
-"Dr. Sharma, a new trial in your digest shows 3-month fluoride recall cuts caries recurrence
-38% better than 6-month for high-risk adults. Want me to draft a patient note on this? — JIDA
-Oct 2026 p.14"
+EXAMPLE OF A STRONG MESSAGE (specificity + loss aversion, CTA last):
+"Quick nudge: your dashboard shows 6,777 missed searches in Sector 14 for makeup services —
+people are looking but not finding you. Want me to show how your listing would appear?"
+Notice: the number is specific and verifiable, the locality is named, "missed searches" frames
+loss, and the single question-CTA is the last sentence.
 
 You must respond with ONLY a JSON object (no markdown fences, no commentary) with these exact \
 keys:
@@ -273,36 +215,12 @@ keys:
 """
 
 
-def condense_category(category: dict) -> dict:
-    """The full category JSON (digest + patient_content_library especially) runs
-    ~2,000 tokens on its own -- combined with the system prompt (~1,300 tokens)
-    and merchant/trigger context, a SINGLE compose call was already blowing
-    Groq's free-tier 6,000 TPM budget by itself, which is why calls were
-    429-ing even on a completely fresh API key/quota. Send only what the
-    prompt rules actually reference: voice, offer_catalog, peer_stats,
-    seasonal_beats, trend_signals, and just the top 2 digest items (still
-    enough for a cited-research message) rather than the full research/content
-    libraries."""
-    return {
-        "slug": category.get("slug"),
-        "display_name": category.get("display_name"),
-        "voice": category.get("voice"),
-        "offer_catalog": category.get("offer_catalog"),
-        "peer_stats": category.get("peer_stats"),
-        "seasonal_beats": category.get("seasonal_beats"),
-        "trend_signals": category.get("trend_signals"),
-        # Top 2 only -- still supports a cited-research message (rule 12)
-        # without paying for the entire week's digest every single call.
-        "digest": (category.get("digest") or [])[:2],
-    }
-
-
 def build_compose_user_prompt(
     category: dict, merchant: dict, trigger: dict, customer: Optional[dict]
 ) -> str:
     parts = [
         "=== CATEGORY CONTEXT ===",
-        json.dumps(condense_category(category), ensure_ascii=False, indent=2),
+        json.dumps(category, ensure_ascii=False, indent=2),
         "",
         "=== MERCHANT CONTEXT ===",
         json.dumps(merchant, ensure_ascii=False, indent=2),
@@ -332,33 +250,12 @@ def build_compose_user_prompt(
 
 def fallback_compose(category: dict, merchant: dict, trigger: dict, customer: Optional[dict]) -> dict:
     """Used only if the LLM call fails — keeps the endpoint from erroring out.
-    Pulls one concrete, real data point from the context if available (a
-    performance delta, an active offer) so even the degraded path isn't fully
-    generic — a bare "quick update" line scores very poorly on specificity and
-    merchant fit, and this recovers some of that without needing the LLM."""
+    Simple, safe, generic — not meant to score well, just to not crash."""
     name = merchant.get("identity", {}).get("name", "there")
-    kind = trigger.get("kind", "update").replace("_", " ")
-
-    detail = None
-    perf = merchant.get("performance", {}) or {}
-    views_pct = (perf.get("delta_7d") or {}).get("views_pct")
-    if views_pct is not None:
-        pct = views_pct * 100
-        detail = f"views are {'up' if pct >= 0 else 'down'} {abs(pct):.0f}% this week"
-    elif perf.get("ctr") is not None:
-        detail = f"your CTR is currently {perf['ctr'] * 100:.1f}%"
-    else:
-        active_offers = [o.get("title") for o in (merchant.get("offers") or []) if o.get("status") == "active"]
-        if active_offers and active_offers[0]:
-            detail = f"your active offer ({active_offers[0]}) is live right now"
-
-    if detail:
-        body = f"Hi {name}, quick note related to {kind} — {detail}. Want me to share more details?"
-    else:
-        body = f"Hi {name}, quick update on your account related to {kind}. Want me to share the details?"
-
+    kind = trigger.get("kind", "update")
     return {
-        "body": body,
+        "body": f"Hi {name}, quick update on your account related to {kind.replace('_', ' ')}. "
+                f"Want me to share the details?",
         "cta": "open_ended",
         "send_as": "merchant_on_behalf" if customer else "vera",
         "rationale": "Fallback composer used because the LLM call failed.",
@@ -393,17 +290,10 @@ def compose_message(
     if parsed["body"] in already_sent:
         parsed["body"] += " "  # trivial de-dup nudge; real fix is better prompting
 
-    # Guardrail: send_as is never left to the LLM's discretion. Whether a customer
-    # was populated is a hard fact of the input, not a judgment call, and getting
-    # this wrong changes which voice rules apply (merchant-facing vs regulated
-    # customer-facing) -- so we force the correct value regardless of what the
-    # model said.
-    correct_send_as = "merchant_on_behalf" if customer else "vera"
-
     return {
         "body": parsed.get("body", ""),
         "cta": parsed.get("cta", "open_ended"),
-        "send_as": correct_send_as,
+        "send_as": parsed.get("send_as", "merchant_on_behalf" if customer else "vera"),
         "rationale": parsed.get("rationale", ""),
     }
 
@@ -438,10 +328,6 @@ language of your earlier turns.
 - Never repeat a message body you already sent in this conversation.
 - Keep the same voice/category rules as always: specific, non-promotional, one CTA max, CTA \
 in the last sentence.
-- If a CURRENT CONTEXT block is provided below, treat it as the freshest available data (it may \
-include numbers that changed since this conversation started). Ground any factual claim you \
-make in that block or in the conversation history — never invent a number, offer, or fact that \
-appears in neither.
 
 EXAMPLE — CORRECT intent handoff:
 [MERCHANT] "Ok lets do it, whats next?"
@@ -470,15 +356,22 @@ these three shapes:
 """
 
 
-def is_probable_auto_reply(text: str, prior_texts: list[str]) -> bool:
-    """Heuristic: canned auto-replies tend to repeat verbatim, and contain phrases
-    like 'thank you for contacting' / 'automated' / 'team will get back'."""
+def has_canned_auto_reply_marker(text: str) -> bool:
+    """Checks ONLY for canned/automated-sounding phrasing, independent of repeat
+    count. Used for the merchant-level guardrail below, since conversation_ids
+    can differ per turn even for the same merchant's auto-reply."""
     lowered = text.strip().lower()
     canned_markers = [
         "thank you for contacting", "our team will", "automated assistant",
         "we will get back to you", "shukriya", "team tak pahuncha",
     ]
-    marker_hit = any(m in lowered for m in canned_markers)
+    return any(m in lowered for m in canned_markers)
+
+
+def is_probable_auto_reply(text: str, prior_texts: list[str]) -> bool:
+    """Heuristic: canned auto-replies tend to repeat verbatim, and contain phrases
+    like 'thank you for contacting' / 'automated' / 'team will get back'."""
+    marker_hit = has_canned_auto_reply_marker(text)
     repeat_hit = prior_texts.count(text.strip()) >= 1  # seen this exact text before
     return marker_hit or repeat_hit
 
@@ -499,14 +392,7 @@ def is_explicit_stop_request(text: str) -> bool:
     return any(m in lowered for m in stop_markers)
 
 
-def compose_reply(
-    conv: dict,
-    merchant_message: str,
-    merchant_repeat_count: int = 0,
-    category: Optional[dict] = None,
-    merchant: Optional[dict] = None,
-    customer: Optional[dict] = None,
-) -> dict:
+def compose_reply(conv: dict, merchant_message: str) -> dict:
     # Guardrail: explicit stop/hostile requests always end the conversation,
     # regardless of what the LLM would say. This is intentionally a hard rule,
     # not left to the model, because getting this wrong is costly (annoys a
@@ -520,11 +406,8 @@ def compose_reply(
 
     # Guardrail: the exact same incoming text 3+ times in a row is, per the brief's
     # own hint, a very strong auto-reply signal. Don't rely on the LLM to comply
-    # every time -- force the exit so we never loop forever on a bot. We check
-    # BOTH the per-conversation counter and the per-merchant counter, because a
-    # fresh conversation_id per turn (seen in practice) would otherwise reset
-    # the per-conversation counter every time and let the loop run forever.
-    if conv.get("repeat_count", 0) >= 2 or merchant_repeat_count >= 2:
+    # every time -- force the exit so we never loop forever on a bot.
+    if conv.get("repeat_count", 0) >= 2:
         return {
             "action": "end",
             "rationale": "Same incoming message repeated 3+ times verbatim -- "
@@ -539,29 +422,13 @@ def compose_reply(
     history_text = "\n".join(
         f"[{t['from'].upper()}] {t['body']}" for t in conv["turns"]
     )
-
-    context_block = ""
-    if merchant or category or customer:
-        ctx_parts = ["\nCURRENT CONTEXT (freshest data available -- use this to ground any "
-                     "factual claim; it may have changed since the conversation started):"]
-        if merchant:
-            ctx_parts.append("MERCHANT: " + json.dumps(merchant, ensure_ascii=False))
-        if category:
-            ctx_parts.append("CATEGORY: " + json.dumps(category, ensure_ascii=False))
-        if customer:
-            ctx_parts.append("CUSTOMER: " + json.dumps(customer, ensure_ascii=False))
-        context_block = "\n".join(ctx_parts) + "\n"
-
     user = (
         f"Conversation so far:\n{history_text}\n\n"
         f"Latest incoming message: {merchant_message}\n\n"
         f"Heuristic note: this message {'LOOKS LIKE an auto-reply' if auto_reply_suspected else 'looks like a real reply'} "
-        f"(repeat count of this exact text so far, this conversation: "
-        f"{prior_incoming.count(merchant_message.strip())}; across this merchant overall: "
-        f"{merchant_repeat_count}).\n"
+        f"(repeat count of this exact text so far: {prior_incoming.count(merchant_message.strip())}).\n"
         f"Messages Vera already sent in this conversation (never repeat verbatim): "
-        f"{json.dumps(conv['sent_bodies'], ensure_ascii=False)}\n"
-        f"{context_block}"
+        f"{json.dumps(conv['sent_bodies'], ensure_ascii=False)}"
     )
 
     try:
@@ -571,7 +438,7 @@ def compose_reply(
             raise ValueError("malformed LLM reply output")
     except Exception as e:
         log.warning(f"LLM reply failed, using fallback: {e}")
-        if auto_reply_suspected and (conv.get("repeat_count", 0) >= 1 or merchant_repeat_count >= 1):
+        if auto_reply_suspected and conv["repeat_count"] >= 1:
             parsed = {"action": "end", "rationale": "Auto-reply detected twice; exiting gracefully (fallback)."}
         else:
             parsed = {"action": "send", "body": "Got it — let me know if you'd like to continue.",
@@ -630,12 +497,9 @@ async def metadata():
         "team_members": TEAM_MEMBERS,
         "model": GROQ_MODEL,
         "approach": "Single-prompt LLM composer (Llama 3.3 70B via Groq) over the 4-context "
-                    "framework, with a rule+LLM hybrid for auto-reply detection, intent handoff, "
-                    "and hostile/stop handling. Tick-level restraint (one highest-urgency trigger "
-                    "per merchant per tick, composed concurrently). Reply-time context grounding "
-                    "from live merchant/category state.",
+                    "framework, with a rule+LLM hybrid for auto-reply detection and intent handoff.",
         "contact_email": CONTACT_EMAIL,
-        "version": "1.1.0",
+        "version": "1.0.0",
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -663,15 +527,22 @@ async def teardown():
     contexts.clear()
     conversations.clear()
     fired_suppression_keys.clear()
-    merchant_repeat_tracker.clear()
     return {"ok": True}
 
 
 @app.post("/v1/tick")
 async def tick(body: TickBody):
-    # --- Step 1: gather every eligible trigger (context available, not already fired) ---
-    candidates = []  # list of (trigger, merchant, category, customer, trg_id, suppression_key)
+    actions = []
+    tick_started = time.time()
+    TICK_TIME_BUDGET = 24.0  # stay well under the judge's 30s hard timeout
+
     for trg_id in body.available_triggers:
+        if time.time() - tick_started > TICK_TIME_BUDGET:
+            # Running low on time -- return what we have rather than risk the
+            # whole tick timing out and losing every action in it.
+            log.warning("Tick time budget exceeded; returning partial actions")
+            break
+
         trigger = get_ctx("trigger", trg_id)
         if not trigger:
             continue
@@ -695,58 +566,7 @@ async def tick(body: TickBody):
         if customer_id:
             customer = get_ctx("customer", customer_id)
 
-        candidates.append((trigger, merchant, category, customer, trg_id, suppression_key))
-
-    # --- Step 2: restraint. The brief is explicit that "restraint is rewarded,
-    # spam is penalized" and that the bot is free to decide nothing's worth
-    # sending. Firing on every available trigger every tick reads as spam if two
-    # triggers land for the same merchant in the same 5-minute window -- so we
-    # keep only the single highest-urgency trigger per merchant this tick, and
-    # let lower-priority ones wait for a future tick (they stay eligible since we
-    # don't mark their suppression_key as fired). ---
-    best_per_merchant: dict[str, tuple] = {}
-    for cand in candidates:
-        trigger, merchant, *_rest = cand
-        merchant_id = trigger.get("merchant_id")
-        urgency = trigger.get("urgency", 1)
-        current_best = best_per_merchant.get(merchant_id)
-        if current_best is None or urgency > current_best[0].get("urgency", 1):
-            best_per_merchant[merchant_id] = cand
-
-    selected = list(best_per_merchant.values())[:20]  # respect the per-tick action cap
-
-    if not selected:
-        return {"actions": []}
-
-    # --- Step 3: compose all selected messages concurrently (each is a blocking
-    # HTTP call to the LLM) so a tick with many merchants doesn't blow the 30s
-    # per-tick budget by running everything sequentially. Concurrency is capped
-    # (not unlimited) -- firing all N calls at once can trip Groq's free-tier
-    # rate limit, and a 429 falls straight to the generic fallback text, which
-    # scores worse than just being slightly slower. 3 at a time balances speed
-    # against burst risk. ---
-    compose_semaphore = asyncio.Semaphore(1)
-
-    async def _compose_limited(category, merchant, trigger, customer):
-        async with compose_semaphore:
-            return await asyncio.to_thread(compose_message, category, merchant, trigger, customer, [])
-
-    composed_results = await asyncio.gather(
-        *[
-            _compose_limited(category, merchant, trigger, customer)
-            for (trigger, merchant, category, customer, trg_id, suppression_key) in selected
-        ],
-        return_exceptions=True,
-    )
-
-    actions = []
-    for (trigger, merchant, category, customer, trg_id, suppression_key), composed in zip(selected, composed_results):
-        merchant_id = trigger.get("merchant_id")
-        customer_id = trigger.get("customer_id")
-
-        if isinstance(composed, Exception):
-            log.warning(f"compose_message raised unexpectedly, using fallback: {composed}")
-            composed = fallback_compose(category, merchant, trigger, customer)
+        composed = compose_message(category, merchant, trigger, customer, already_sent=[])
 
         conversation_id = f"conv_{merchant_id}_{trg_id}"
         conversations[conversation_id] = {
@@ -774,6 +594,9 @@ async def tick(body: TickBody):
             "rationale": composed["rationale"],
         })
 
+        if len(actions) >= 20:  # respect the per-tick action cap
+            break
+
     return {"actions": actions}
 
 
@@ -796,47 +619,16 @@ async def reply(body: ReplyBody):
     if conv["ended"]:
         return {"action": "end", "rationale": "Conversation already ended."}
 
-    # Resolve merchant_id from whichever source has it (conv state first, since
-    # it's the one we set ourselves at tick() time; body.merchant_id as fallback).
-    merchant_id = conv.get("merchant_id") or body.merchant_id
-
-    # Track repeats of the exact same incoming text, per CONVERSATION (works when
-    # the same conversation_id is reused across turns).
+    # Track repeats of the exact same incoming text (auto-reply signal)
     if conv["last_merchant_text"] == body.message.strip():
         conv["repeat_count"] += 1
     else:
         conv["repeat_count"] = 0
     conv["last_merchant_text"] = body.message.strip()
 
-    # ALSO track repeats per MERCHANT, independent of conversation_id. This is the
-    # guardrail that actually catches auto-reply loops when a fresh conversation_id
-    # is issued every turn (seen in practice with the local judge simulator) --
-    # a per-conversation-only counter would never accumulate in that case.
-    merchant_repeat_count = 0
-    if merchant_id:
-        tracker = merchant_repeat_tracker.setdefault(merchant_id, {"last_text": None, "count": 0})
-        if tracker["last_text"] == body.message.strip():
-            tracker["count"] += 1
-        else:
-            tracker["count"] = 0
-        tracker["last_text"] = body.message.strip()
-        merchant_repeat_count = tracker["count"]
-
     conv["turns"].append({"from": body.from_role, "body": body.message})
 
-    # Fetch the freshest context we have for grounding (handles both accurate
-    # replies mid-conversation and the "adaptive context injection" phase, where
-    # the judge pushes updated merchant/category data mid-test).
-    merchant = get_ctx("merchant", merchant_id) if merchant_id else None
-    category = get_ctx("category", merchant.get("category_slug")) if merchant else None
-    customer_id = conv.get("customer_id") or body.customer_id
-    customer = get_ctx("customer", customer_id) if customer_id else None
-
-    decision = compose_reply(
-        conv, body.message,
-        merchant_repeat_count=merchant_repeat_count,
-        category=category, merchant=merchant, customer=customer,
-    )
+    decision = compose_reply(conv, body.message)
 
     if decision.get("action") == "send":
         response_body = decision.get("body", "")
