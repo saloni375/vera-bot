@@ -98,12 +98,8 @@ def get_ctx(scope: str, context_id: str) -> Optional[dict]:
 
 def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
     """Calls Groq (Llama 3.3 70B) and returns raw text output. Temperature=0 for
-    determinism. Named call_claude for minimal diff elsewhere in this file --
-    it's the one function that talks to whichever LLM we're using.
-
-    Retries a few times with backoff on rate limits (429) and transient server
-    errors (5xx) before giving up -- these are common on free-tier API keys
-    under bursty load and are usually resolved within a second or two."""
+    determinism. Retries a few times with backoff on rate limits (429) and
+    transient server errors (5xx) before giving up."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
 
@@ -117,19 +113,6 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
         "max_tokens": max_tokens,
     }
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    last_exc = None
-    delays = [0, 1.2]  # immediate try, then one short backoff retry -- kept short
-                       # so a few triggers in one /v1/tick call don't blow the 30s budget
-    for delay in delays:
-        if delay:
-            time.sleep(delay)
-        try:
-            headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
@@ -153,11 +136,9 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
             continue
 
     raise last_exc or RuntimeError("Groq call failed after retries")
-        except requests.RequestException as e:
-            last_exc = e
-            continue
 
-    raise last_exc or RuntimeError("Groq call failed after retries")
+
+</parameter>
 
 
 def safe_json_parse(text: str) -> Optional[dict]:
