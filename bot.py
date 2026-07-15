@@ -141,20 +141,24 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
     }
 
     last_exc: Optional[Exception] = None
-    max_attempts = 4  # 1 initial try + 3 retries -- rate-limit bursts need more
-    # room to clear than a single retry gives, and our 30s per-tick budget
-    # comfortably allows a few short backoffs before falling back.
+    max_attempts = 2  # 1 initial try + 1 retry. The judge harness's /v1/tick
+    # call has a hard ~15s client-side read timeout -- a composition (or
+    # several, running concurrently under the semaphore) must return well
+    # inside that. More attempts sounds safer but actually causes silent
+    # request timeouts (worse than a fallback response, since the judge gets
+    # NOTHING) if the total retry time creeps past ~15s. Keep this small.
     for attempt in range(max_attempts):
         try:
-            resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=12)
+            resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=6)
             if resp.status_code == 429:
-                # Respect Retry-After if Groq sends one; otherwise back off
-                # progressively (2s, 4s, 6s) instead of a flat 3s every time --
-                # a fixed short wait doesn't help when the limiter window is
-                # longer than that, and this is still small compared to the
-                # per-tick timeout budget.
+                # Respect Retry-After but cap hard at 1.5s -- large values
+                # (seen: 38s, meaning a daily quota window, not a transient
+                # burst) can't be waited out inside one request anyway; if
+                # quota is genuinely exhausted, fail fast to fallback_compose
+                # instead of eating the tick's time budget and returning
+                # nothing at all.
                 retry_after = resp.headers.get("Retry-After")
-                wait_s = float(retry_after) if retry_after else min(2.0 * (attempt + 1), 6.0)
+                wait_s = min(float(retry_after), 1.5) if retry_after else 1.5
                 last_exc = RuntimeError("Groq rate-limited (429)")
                 if attempt < max_attempts - 1:
                     log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}/{max_attempts}); "
