@@ -129,14 +129,30 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
         if delay:
             time.sleep(delay)
         try:
+            headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    last_exc = None
+    delays = [0, 1.5, 4.0]
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
             resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=25)
             if resp.status_code == 429 or resp.status_code >= 500:
-                # Rate-limited or transient server error -- worth retrying.
                 last_exc = RuntimeError(f"Groq returned {resp.status_code}, retrying")
                 continue
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
+        except requests.RequestException as e:
+            last_exc = e
+            continue
+
+    raise last_exc or RuntimeError("Groq call failed after retries")
         except requests.RequestException as e:
             last_exc = e
             continue
