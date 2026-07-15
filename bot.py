@@ -108,7 +108,15 @@ def get_ctx(scope: str, context_id: str) -> Optional[dict]:
 def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
     """Calls Groq (Llama 3.3 70B) and returns raw text output. Temperature=0 for
     determinism. Named call_claude for minimal diff elsewhere in this file --
-    it's the one function that talks to whichever LLM we're using."""
+    it's the one function that talks to whichever LLM we're using.
+
+    Retries once on HTTP 429 (rate limited). This matters because a burst of
+    concurrent tick() compositions (or a shared Groq key also being hit by a
+    local test scorer) can trip Groq's free-tier rate limit -- without a retry,
+    every 429'd call falls straight to the generic fallback_compose() text,
+    which scores badly (low specificity/merchant fit) even though nothing is
+    actually wrong with the prompt. One short backoff-and-retry recovers most
+    of these without blowing the caller's ~30s response budget."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set")
 
@@ -121,19 +129,35 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
         "temperature": 0,
         "max_tokens": max_tokens,
     }
-    resp = requests.post(
-        GROQ_URL,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        },
-        json=body,
-        timeout=25,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):  # 1 initial try + 1 retry
+        try:
+            resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=12)
+            if resp.status_code == 429:
+                wait_s = min(float(resp.headers.get("Retry-After", 1.5)), 3.0)
+                log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}); "
+                            f"retrying in {wait_s:.1f}s")
+                last_exc = RuntimeError("Groq rate-limited (429)")
+                if attempt == 0:
+                    time.sleep(wait_s)
+                    continue
+                raise last_exc
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            raise
+    raise last_exc or RuntimeError("Groq call failed after retries")
 
 
 def safe_json_parse(text: str) -> Optional[dict]:
@@ -265,12 +289,33 @@ def build_compose_user_prompt(
 
 def fallback_compose(category: dict, merchant: dict, trigger: dict, customer: Optional[dict]) -> dict:
     """Used only if the LLM call fails — keeps the endpoint from erroring out.
-    Simple, safe, generic — not meant to score well, just to not crash."""
+    Pulls one concrete, real data point from the context if available (a
+    performance delta, an active offer) so even the degraded path isn't fully
+    generic — a bare "quick update" line scores very poorly on specificity and
+    merchant fit, and this recovers some of that without needing the LLM."""
     name = merchant.get("identity", {}).get("name", "there")
-    kind = trigger.get("kind", "update")
+    kind = trigger.get("kind", "update").replace("_", " ")
+
+    detail = None
+    perf = merchant.get("performance", {}) or {}
+    views_pct = (perf.get("delta_7d") or {}).get("views_pct")
+    if views_pct is not None:
+        pct = views_pct * 100
+        detail = f"views are {'up' if pct >= 0 else 'down'} {abs(pct):.0f}% this week"
+    elif perf.get("ctr") is not None:
+        detail = f"your CTR is currently {perf['ctr'] * 100:.1f}%"
+    else:
+        active_offers = [o.get("title") for o in (merchant.get("offers") or []) if o.get("status") == "active"]
+        if active_offers and active_offers[0]:
+            detail = f"your active offer ({active_offers[0]}) is live right now"
+
+    if detail:
+        body = f"Hi {name}, quick note related to {kind} — {detail}. Want me to share more details?"
+    else:
+        body = f"Hi {name}, quick update on your account related to {kind}. Want me to share the details?"
+
     return {
-        "body": f"Hi {name}, quick update on your account related to {kind.replace('_', ' ')}. "
-                f"Want me to share the details?",
+        "body": body,
         "cta": "open_ended",
         "send_as": "merchant_on_behalf" if customer else "vera",
         "rationale": "Fallback composer used because the LLM call failed.",
@@ -632,10 +677,20 @@ async def tick(body: TickBody):
 
     # --- Step 3: compose all selected messages concurrently (each is a blocking
     # HTTP call to the LLM) so a tick with many merchants doesn't blow the 30s
-    # per-tick budget by running everything sequentially. ---
+    # per-tick budget by running everything sequentially. Concurrency is capped
+    # (not unlimited) -- firing all N calls at once can trip Groq's free-tier
+    # rate limit, and a 429 falls straight to the generic fallback text, which
+    # scores worse than just being slightly slower. 3 at a time balances speed
+    # against burst risk. ---
+    compose_semaphore = asyncio.Semaphore(3)
+
+    async def _compose_limited(category, merchant, trigger, customer):
+        async with compose_semaphore:
+            return await asyncio.to_thread(compose_message, category, merchant, trigger, customer, [])
+
     composed_results = await asyncio.gather(
         *[
-            asyncio.to_thread(compose_message, category, merchant, trigger, customer, [])
+            _compose_limited(category, merchant, trigger, customer)
             for (trigger, merchant, category, customer, trg_id, suppression_key) in selected
         ],
         return_exceptions=True,
