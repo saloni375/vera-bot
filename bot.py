@@ -110,7 +110,7 @@ def get_ctx(scope: str, context_id: str) -> Optional[dict]:
 # LLM call (Gemini)
 # -----------------------------------------------------------------------------
 
-def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
+def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 350) -> str:
     """Calls Groq (Llama 3.3 70B) and returns raw text output. Temperature=0 for
     determinism. Named call_claude for minimal diff elsewhere in this file --
     it's the one function that talks to whichever LLM we're using.
@@ -273,12 +273,36 @@ keys:
 """
 
 
+def condense_category(category: dict) -> dict:
+    """The full category JSON (digest + patient_content_library especially) runs
+    ~2,000 tokens on its own -- combined with the system prompt (~1,300 tokens)
+    and merchant/trigger context, a SINGLE compose call was already blowing
+    Groq's free-tier 6,000 TPM budget by itself, which is why calls were
+    429-ing even on a completely fresh API key/quota. Send only what the
+    prompt rules actually reference: voice, offer_catalog, peer_stats,
+    seasonal_beats, trend_signals, and just the top 2 digest items (still
+    enough for a cited-research message) rather than the full research/content
+    libraries."""
+    return {
+        "slug": category.get("slug"),
+        "display_name": category.get("display_name"),
+        "voice": category.get("voice"),
+        "offer_catalog": category.get("offer_catalog"),
+        "peer_stats": category.get("peer_stats"),
+        "seasonal_beats": category.get("seasonal_beats"),
+        "trend_signals": category.get("trend_signals"),
+        # Top 2 only -- still supports a cited-research message (rule 12)
+        # without paying for the entire week's digest every single call.
+        "digest": (category.get("digest") or [])[:2],
+    }
+
+
 def build_compose_user_prompt(
     category: dict, merchant: dict, trigger: dict, customer: Optional[dict]
 ) -> str:
     parts = [
         "=== CATEGORY CONTEXT ===",
-        json.dumps(category, ensure_ascii=False, indent=2),
+        json.dumps(condense_category(category), ensure_ascii=False, indent=2),
         "",
         "=== MERCHANT CONTEXT ===",
         json.dumps(merchant, ensure_ascii=False, indent=2),
@@ -701,7 +725,7 @@ async def tick(body: TickBody):
     # rate limit, and a 429 falls straight to the generic fallback text, which
     # scores worse than just being slightly slower. 3 at a time balances speed
     # against burst risk. ---
-    compose_semaphore = asyncio.Semaphore(2)
+    compose_semaphore = asyncio.Semaphore(1)
 
     async def _compose_limited(category, merchant, trigger, customer):
         async with compose_semaphore:
