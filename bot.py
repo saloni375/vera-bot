@@ -52,7 +52,12 @@ START_TIME = time.time()
 # NEVER hard-code the real key into this file if you're going to push it to
 # a public GitHub repo.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# llama-3.3-70b-versatile has a very small free-tier daily quota on Groq and
+# was getting exhausted mid-test (every single call 429'd -- see logs). The
+# 8b-instant model has a much larger free-tier allowance and is still good
+# enough for structured JSON message composition. Override via env var if a
+# paid/higher-quota key is available.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 TEAM_NAME = os.environ.get("TEAM_NAME", "Solo Builder")
@@ -136,24 +141,34 @@ def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> 
     }
 
     last_exc: Optional[Exception] = None
-    for attempt in range(2):  # 1 initial try + 1 retry
+    max_attempts = 4  # 1 initial try + 3 retries -- rate-limit bursts need more
+    # room to clear than a single retry gives, and our 30s per-tick budget
+    # comfortably allows a few short backoffs before falling back.
+    for attempt in range(max_attempts):
         try:
             resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=12)
             if resp.status_code == 429:
-                wait_s = min(float(resp.headers.get("Retry-After", 1.5)), 3.0)
-                log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}); "
-                            f"retrying in {wait_s:.1f}s")
+                # Respect Retry-After if Groq sends one; otherwise back off
+                # progressively (2s, 4s, 6s) instead of a flat 3s every time --
+                # a fixed short wait doesn't help when the limiter window is
+                # longer than that, and this is still small compared to the
+                # per-tick timeout budget.
+                retry_after = resp.headers.get("Retry-After")
+                wait_s = float(retry_after) if retry_after else min(2.0 * (attempt + 1), 6.0)
                 last_exc = RuntimeError("Groq rate-limited (429)")
-                if attempt == 0:
+                if attempt < max_attempts - 1:
+                    log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}/{max_attempts}); "
+                                f"retrying in {wait_s:.1f}s")
                     time.sleep(wait_s)
                     continue
+                log.warning(f"Groq 429 rate-limited (attempt {attempt + 1}/{max_attempts}); giving up")
                 raise last_exc
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
         except requests.exceptions.RequestException as e:
             last_exc = e
-            if attempt == 0:
+            if attempt < max_attempts - 1:
                 time.sleep(0.5)
                 continue
             raise
@@ -682,7 +697,7 @@ async def tick(body: TickBody):
     # rate limit, and a 429 falls straight to the generic fallback text, which
     # scores worse than just being slightly slower. 3 at a time balances speed
     # against burst risk. ---
-    compose_semaphore = asyncio.Semaphore(3)
+    compose_semaphore = asyncio.Semaphore(2)
 
     async def _compose_limited(category, merchant, trigger, customer):
         async with compose_semaphore:
