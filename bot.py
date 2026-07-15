@@ -57,7 +57,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # 8b-instant model has a much larger free-tier allowance and is still good
 # enough for structured JSON message composition. Override via env var if a
 # paid/higher-quota key is available.
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 TEAM_NAME = os.environ.get("TEAM_NAME", "Solo Builder")
